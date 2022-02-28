@@ -6,6 +6,8 @@ import (
 	"crypto/x509"
 	"errors"
 	"flag"
+	"fmt"
+	"gopkg.in/yaml.v2"
 	"io"
 	"io/ioutil"
 	"net/http"
@@ -111,10 +113,20 @@ func TestTCPv4Network(t *testing.T) {
 // Ensure that http and grpc servers work with no overrides to config
 // (except http port because an ordinary user can't bind to default port 80)
 func TestDefaultAddresses(t *testing.T) {
+	testDefaultAddresses(t, false)
+	testDefaultAddresses(t, true)
+}
+
+func testDefaultAddresses(t *testing.T, optional bool) {
 	var cfg Config
 	cfg.RegisterFlags(flag.NewFlagSet("", flag.ExitOnError))
 	cfg.HTTPListenPort = 9090
 	cfg.MetricsNamespace = "testing_addresses"
+	if optional {
+		cfg.GRPCTLSConfig.Optional = true
+		cfg.HTTPTLSConfig.Optional = true
+		cfg.MetricsNamespace = "optional"
+	}
 
 	server, err := New(cfg)
 	require.NoError(t, err)
@@ -511,6 +523,11 @@ func TestMiddlewareLogging(t *testing.T) {
 }
 
 func TestTLSServer(t *testing.T) {
+	testTLSServer(t, false)
+	testTLSServer(t, true)
+}
+
+func testTLSServer(t *testing.T, optional bool) {
 	var level logging.Level
 	level.Set("info")
 
@@ -522,19 +539,25 @@ func TestTLSServer(t *testing.T) {
 		HTTPListenNetwork: DefaultNetwork,
 		HTTPListenAddress: "localhost",
 		HTTPListenPort:    9193,
-		HTTPTLSConfig: node_https.TLSStruct{
-			TLSCertPath: "certs/server.crt",
-			TLSKeyPath:  "certs/server.key",
-			ClientAuth:  "RequireAndVerifyClientCert",
-			ClientCAs:   "certs/root.crt",
+		HTTPTLSConfig: TLSStruct{
+			TLSStruct: node_https.TLSStruct{
+				TLSCertPath: "certs/server.crt",
+				TLSKeyPath:  "certs/server.key",
+				ClientAuth:  "RequireAndVerifyClientCert",
+				ClientCAs:   "certs/root.crt",
+			},
+			Optional: optional,
 		},
-		GRPCTLSConfig: node_https.TLSStruct{
-			TLSCertPath: "certs/server.crt",
-			TLSKeyPath:  "certs/server.key",
-			ClientAuth:  "VerifyClientCertIfGiven",
-			ClientCAs:   "certs/root.crt",
+		GRPCTLSConfig: TLSStruct{
+			TLSStruct: node_https.TLSStruct{
+				TLSCertPath: "certs/server.crt",
+				TLSKeyPath:  "certs/server.key",
+				ClientAuth:  "VerifyClientCertIfGiven",
+				ClientCAs:   "certs/root.crt",
+			},
+			Optional: optional,
 		},
-		MetricsNamespace:  "testing_tls",
+		MetricsNamespace:  fmt.Sprintf("testing_tls_optional_%v", optional),
 		GRPCListenNetwork: DefaultNetwork,
 		GRPCListenAddress: "localhost",
 		GRPCListenPort:    9194,
@@ -591,6 +614,45 @@ func TestTLSServer(t *testing.T) {
 	grpcRes, err := grpcClient.Succeed(context.Background(), &empty)
 	require.NoError(t, err)
 	require.EqualValues(t, &empty, grpcRes)
+
+	if optional {
+		client := &http.Client{}
+		res, err := client.Get("http://localhost:9193/testhttps")
+		require.NoError(t, err)
+		defer res.Body.Close()
+
+		require.Equal(t, res.StatusCode, http.StatusOK)
+
+		body, err := ioutil.ReadAll(res.Body)
+		require.NoError(t, err)
+		expected := []byte("Hello World!")
+		require.Equal(t, expected, body)
+
+		conn, err := grpc.Dial("localhost:9194", grpc.WithInsecure())
+		defer conn.Close()
+		require.NoError(t, err)
+
+		empty := google_protobuf.Empty{}
+		grpcClient := NewFakeServerClient(conn)
+		grpcRes, err := grpcClient.Succeed(context.Background(), &empty)
+		require.NoError(t, err)
+		require.EqualValues(t, &empty, grpcRes)
+	}
+}
+
+// Make sure that parsing inline TLS config works.
+func TestParseConfig(t *testing.T) {
+	cfg := Config{}
+	txt := `
+http_tls_config:
+  optional: true
+  cert_file: cert
+`
+	err := yaml.Unmarshal([]byte(txt), &cfg)
+	require.NoError(t, err)
+
+	require.Equal(t, true, cfg.HTTPTLSConfig.Optional)
+	require.Equal(t, "cert", cfg.HTTPTLSConfig.TLSCertPath)
 }
 
 type FakeLogger struct {
